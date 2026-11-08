@@ -9,6 +9,7 @@ import copy
 import itertools
 from pathlib import Path
 import re
+import shlex
 import unittest
 
 import jinja2
@@ -137,7 +138,7 @@ class Rig:
             self.trace.append(line)
             command, _, rest = line.partition(' ')
             command = command.upper()
-            tokens = rest.split()
+            tokens = shlex.split(rest) if command == 'SET_GCODE_VARIABLE' else rest.split()
             params = {}
             for token in tokens:
                 if '=' in token:
@@ -273,7 +274,21 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn('M204 S10000', start)
         rig.run('_PREP_MOTION_BEGIN')
         clean = rig.render('gcode_macro CLEAR_NOZZLE')
-        self.assertIn('M204 S1500', clean)
+        self.assertIn('M204 S5000', clean)
+        self.assertLess(clean.index('_PREP_MOTION_CLEAN_BEGIN'), clean.index('M204 S5000'))
+        self.assertLess(clean.index('_PREP_MOTION_CLEAN_END'), clean.index('G1 Z30'))
+        rig.run('_PREP_MOTION_CLEAN_BEGIN\nM204 S5000')
+        self.assertEqual(rig.printer['toolhead']['max_velocity'], 600)
+        self.assertEqual(rig.printer['toolhead']['max_accel'], 5000)
+        rig.run('_PREP_MOTION_CLEAN_END')
+        self.assertEqual(rig.printer['toolhead']['max_velocity'], 150)
+        self.assertEqual(rig.printer['toolhead']['max_accel'], 2000)
+
+    def test_macro_names_match_firmware_command_parser(self):
+        for name in MACROS:
+            parts = re.split('([A-Z_]+|[A-Z*/])', name)
+            parsed = parts[1] + parts[2].strip()
+            self.assertEqual(parsed, name, 'Macro name cannot be dispatched by Klipper: ' + name)
 
     def test_includes_and_template_syntax(self):
         self.assertEqual(set(EXTERNAL), {'MCU_ID.cfg', 'timelapse.cfg', 'box.cfg'})
