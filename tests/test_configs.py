@@ -69,7 +69,7 @@ class Rig:
             'gcode': dict(commands={'E_LOAD': {}, 'E_UNLOAD': {}}),
             'toolhead': dict(homed_axes=homed, axis_minimum=vector(-1, -1, -2),
                              axis_maximum=vector(275, 295, 265), position=vector(135, 135, 10),
-                             max_velocity=600),
+                             max_velocity=600, max_accel=10000, square_corner_velocity=8, minimum_cruise_ratio=0.5),
             'gcode_move': dict(position=vector(135, 135, 10), gcode_position=vector(135, 135, 10),
                                homing_origin=vector(), absolute_coordinates=True,
                                absolute_extrude=False),
@@ -98,6 +98,7 @@ class Rig:
                 self.printer[name] = {k[9:]: ast.literal_eval(v) for k, v in data.items() if k.startswith('variable_')}
         self.trace, self.raw_homes, self.moves = [], [], []
         self.states, self.timers = {}, {}
+        self.motion_limits = []
         self.homing_override_active = False
         self.retracted = False
         self.objects(100, 100, 150, 150)
@@ -164,6 +165,15 @@ class Rig:
             elif command == 'SET_GCODE_VARIABLE':
                 key = next(s for s in self.printer if s.startswith('gcode_macro ') and s.split(' ', 1)[1].upper() == params['MACRO'].upper())
                 self.printer[key][params['VARIABLE']] = ast.literal_eval(params['VALUE'])
+            elif command == 'SET_VELOCITY_LIMIT':
+                th = self.printer['toolhead']
+                for arg, key in [('VELOCITY', 'max_velocity'), ('ACCEL', 'max_accel'),
+                                 ('SQUARE_CORNER_VELOCITY', 'square_corner_velocity'),
+                                 ('MINIMUM_CRUISE_RATIO', 'minimum_cruise_ratio')]:
+                    if arg in params:
+                        th[key] = float(params[arg])
+                if 'ACCEL_TO_DECEL' in params:
+                    th['minimum_cruise_ratio'] = 1 - min(float(params['ACCEL_TO_DECEL']) / th['max_accel'], 1)
             elif command in ('G90', 'G91'):
                 gm['absolute_coordinates'] = command == 'G90'
             elif command in ('M82', 'M83'):
@@ -204,6 +214,7 @@ class Rig:
                 if 'E' in params and float(params['E']) and not self.printer['extruder']['can_extrude']:
                     raise AssertionError('Cold extrusion: ' + line)
                 self.moves.append((line, before, copy.deepcopy(self.printer['toolhead']['position'])))
+                self.motion_limits.append((line, copy.deepcopy(self.printer['toolhead'])))
             elif command in ('G10', 'G11'):
                 self.retracted = command == 'G10'
             elif command == 'UPDATE_DELAYED_GCODE':
@@ -214,6 +225,56 @@ class Rig:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_preparation_scope_and_lower_limits(self):
+        for initial in [(600, 10000, 8, 0.4), (100, 800, 3, 0.7)]:
+            rig = Rig()
+            keys = ('max_velocity', 'max_accel', 'square_corner_velocity', 'minimum_cruise_ratio')
+            rig.printer['toolhead'].update(zip(keys, initial))
+            rig.run('_PREP_MOTION_BEGIN\nM204 S5000\n_PREP_MOTION_BEGIN')
+            th = rig.printer['toolhead']
+            self.assertEqual(th['max_velocity'], min(150, initial[0]))
+            self.assertEqual(th['max_accel'], min(2000, initial[1]))
+            rig.run('SMART_PARK')
+            self.assertEqual(rig.printer['gcode_macro _PREP_MOTION']['active'], 1)
+            rig.run('_PREP_MOTION_END')
+            self.assertEqual(tuple(th[k] for k in keys), initial)
+            self.assertEqual(rig.printer['gcode_macro _PREP_MOTION']['active'], 0)
+
+    def test_standalone_park_and_purge_limits_restore(self):
+        for command in ['SMART_PARK', 'LINE_PURGE']:
+            rig = Rig()
+            rig.printer['toolhead']['minimum_cruise_ratio'] = 0.37
+            rig.run(command)
+            for line, th in rig.motion_limits:
+                self.assertLessEqual(th['max_velocity'], 150, line)
+                self.assertLessEqual(th['max_accel'], 2000, line)
+                if ' X' in line or ' Y' in line:
+                    self.assertLessEqual(float(re.search(r' F([0-9.]+)', line)[1]), 9000, line)
+            th = rig.printer['toolhead']
+            self.assertEqual((th['max_velocity'], th['max_accel'], th['minimum_cruise_ratio']), (600, 10000, 0.37))
+            self.assertFalse(rig.printer['gcode_macro _PREP_MOTION']['active'])
+
+    def test_preparation_homing_and_cancellation_restore(self):
+        rig = Rig()
+        rig.run('_PREP_MOTION_BEGIN\nG28')
+        homing_moves = list(rig.motion_limits)
+        self.assertTrue(homing_moves)
+        self.assertTrue(all(th['max_velocity'] == 600 and th['max_accel'] == 10000
+                            for _, th in homing_moves))
+        self.assertEqual(rig.printer['toolhead']['max_accel'], 2000)
+        self.assertEqual(rig.printer['toolhead']['max_velocity'], 150)
+        rig.run('CANCEL_PRINT')
+        self.assertEqual(rig.printer['toolhead']['max_accel'], 10000)
+        self.assertEqual(rig.printer['toolhead']['max_velocity'], 600)
+        self.assertFalse(rig.printer['gcode_macro _PREP_MOTION']['active'])
+        start = rig.render('gcode_macro PRINT_START', dict(BED='60', HOTEND='220', CHAMBER='0'))
+        self.assertLess(start.index('_KAMP_PREPARE_PURGE'), start.index('_PREP_MOTION_BEGIN'))
+        self.assertLess(start.index('M109'), start.index('_PREP_MOTION_END'))
+        self.assertNotIn('M204 S10000', start)
+        rig.run('_PREP_MOTION_BEGIN')
+        clean = rig.render('gcode_macro CLEAR_NOZZLE')
+        self.assertIn('M204 S1500', clean)
+
     def test_includes_and_template_syntax(self):
         self.assertEqual(set(EXTERNAL), {'MCU_ID.cfg', 'timelapse.cfg', 'box.cfg'})
         self.assertEqual(sum(s == 'gcode_macro BED_MESH_CALIBRATE' for s in SECTIONS), 1)
